@@ -1,0 +1,20 @@
+{
+  "name": "reachinbox-email-scheduler",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.15.1",
+  "scripts": {
+    "dev": "concurrently -n api,worker,web -c blue,magenta,green \"pnpm --filter @reachinbox/api dev\" \"pnpm --filter @reachinbox/worker dev\" \"pnpm --filter @reachinbox/web dev\"",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "db:generate": "pnpm --filter @reachinbox/database prisma:generate",
+    "db:migrate": "pnpm --filter @reachinbox/database prisma:migrate",
+    "db:studio": "pnpm --filter @reachinbox/database prisma:studio"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2"
+  }
+}
