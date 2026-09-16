@@ -1,0 +1,131 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SenderProvider {
+  SMTP
+  GMAIL
+  OUTLOOK
+}
+
+enum EmailStatus {
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum BatchStatus {
+  CREATED
+  SCHEDULING
+  SCHEDULED
+  PROCESSING
+  COMPLETED
+  PARTIAL_FAILURE
+  FAILED
+  CANCELLED
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  googleId  String?  @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  senders Sender[]
+  batches Batch[]
+  emails  Email[]
+}
+
+model Sender {
+  id            String         @id @default(cuid())
+  userId        String
+  email         String
+  provider      SenderProvider
+  providerConfig Json
+  hourlyLimit   Int            @default(100)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emails Email[]
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+model Batch {
+  id             String      @id @default(cuid())
+  userId         String
+  filename       String?
+  totalEmails    Int         @default(0)
+  processedEmails Int        @default(0)
+  sentEmails     Int         @default(0)
+  failedEmails   Int         @default(0)
+  status         BatchStatus @default(CREATED)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  user  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emails Email[]
+
+  @@index([userId, createdAt])
+}
+
+model Email {
+  id                String      @id @default(cuid())
+  userId            String
+  senderId          String
+  batchId           String?
+  recipientEmail    String
+  subject           String
+  body              String
+  status            EmailStatus @default(SCHEDULED)
+  scheduledAt       DateTime
+  processingAt      DateTime?
+  sentAt            DateTime?
+  failedAt          DateTime?
+  attemptCount      Int         @default(0)
+  lastError         String?
+  providerMessageId String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sender Sender  @relation(fields: [senderId], references: [id], onDelete: Restrict)
+  batch  Batch?  @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  @@index([status, scheduledAt])
+  @@index([senderId, status, scheduledAt])
+  @@index([batchId, status])
+}
+
+model OutboxEvent {
+  id          String       @id @default(cuid())
+  aggregateId String
+  eventType   String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  processedAt DateTime?
+  lastError   String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([status, createdAt])
+  @@index([aggregateId])
+}
