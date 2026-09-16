@@ -1,0 +1,25 @@
+{
+  "name": "@reachinbox/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('worker tests: not configured yet')\""
+  },
+  "dependencies": {
+    "@reachinbox/database": "workspace:*",
+    "@reachinbox/queue": "workspace:*",
+    "ioredis": "^5.7.0",
+    "nodemailer": "^7.0.6",
+    "pino": "^9.9.0"
+  },
+  "devDependencies": {
+    "dotenv": "^17.2.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
