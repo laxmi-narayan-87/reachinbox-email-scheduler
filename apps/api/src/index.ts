@@ -6,7 +6,7 @@ import helmet from 'helmet';
 import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { prisma } from '@reachinbox/database';
-import { createEmailQueue } from '@reachinbox/queue';
+import { createEmailQueue, getEmailJobId } from '@reachinbox/queue';
 import { bulkEmailSchema, createEmailSchema } from '@reachinbox/shared';
 import { createSession, destroySession, requireAuth } from './auth.js';
 import { publishPendingOutbox } from './outbox.js';
@@ -45,7 +45,6 @@ app.post('/api/bootstrap', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : null;
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'valid email required' });
-
   const user = await prisma.user.upsert({ where: { email }, update: { name }, create: { email, name } });
   await createSession(user.id, res);
   res.status(200).json({ id: user.id, email: user.email, name: user.name });
@@ -77,11 +76,9 @@ app.post('/api/emails', requireAuth, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const { senderId, recipientEmail, subject, body, scheduledAt } = parsed.data;
   if (scheduledAt.getTime() < Date.now()) return res.status(400).json({ error: 'scheduledAt must be in the future' });
-
   try {
     const sender = await prisma.sender.findFirst({ where: { id: senderId, userId: req.user!.id } });
     if (!sender) return res.status(404).json({ error: 'sender not found' });
-
     const email = await prisma.$transaction(async (tx) => {
       const created = await tx.email.create({ data: { userId: req.user!.id, senderId, recipientEmail, subject, body, scheduledAt } });
       await tx.outboxEvent.create({ data: { aggregateId: created.id, eventType: 'EMAIL_SCHEDULED', payload: { emailId: created.id } } });
@@ -99,33 +96,20 @@ app.post('/api/batches', requireAuth, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const { senderId, subject, body, scheduledAt, delayBetweenEmailsMs } = parsed.data;
   if (scheduledAt.getTime() < Date.now()) return res.status(400).json({ error: 'scheduledAt must be in the future' });
-
   const recipients = Array.isArray(req.body.recipients) ? req.body.recipients : [];
   const validRecipients = recipients.filter((value): value is string => typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value));
   const uniqueRecipients = [...new Set(validRecipients)];
   if (uniqueRecipients.length === 0) return res.status(400).json({ error: 'recipients must contain at least one valid email' });
   if (uniqueRecipients.length > Number(process.env.MAX_BATCH_SIZE ?? 5000)) return res.status(400).json({ error: 'batch is too large' });
-
   try {
     const sender = await prisma.sender.findFirst({ where: { id: senderId, userId: req.user!.id } });
     if (!sender) return res.status(404).json({ error: 'sender not found' });
-
     const result = await prisma.$transaction(async (tx) => {
       const batch = await tx.batch.create({ data: { userId: req.user!.id, totalEmails: uniqueRecipients.length, status: 'SCHEDULING' } });
       const emails = await Promise.all(uniqueRecipients.map((recipient, index) => tx.email.create({
-        data: {
-          userId: req.user!.id,
-          senderId,
-          batchId: batch.id,
-          recipientEmail: recipient,
-          subject,
-          body,
-          scheduledAt: new Date(scheduledAt.getTime() + index * delayBetweenEmailsMs),
-        },
+        data: { userId: req.user!.id, senderId, batchId: batch.id, recipientEmail: recipient, subject, body, scheduledAt: new Date(scheduledAt.getTime() + index * delayBetweenEmailsMs) },
       })));
-      await tx.outboxEvent.createMany({
-        data: emails.map((email) => ({ aggregateId: email.id, eventType: 'EMAIL_SCHEDULED', payload: { emailId: email.id } })),
-      });
+      await tx.outboxEvent.createMany({ data: emails.map((email) => ({ aggregateId: email.id, eventType: 'EMAIL_SCHEDULED', payload: { emailId: email.id } })) });
       await tx.batch.update({ where: { id: batch.id }, data: { status: 'SCHEDULED' } });
       return { batchId: batch.id, totalEmails: emails.length };
     });
@@ -138,17 +122,15 @@ app.post('/api/batches', requireAuth, async (req, res) => {
 
 app.get('/api/emails', requireAuth, async (req, res) => {
   const status = typeof req.query.status === 'string' ? req.query.status : undefined;
-  const emails = await prisma.email.findMany({
-    where: { userId: req.user!.id, ...(status ? { status: status as never } : {}) },
-    orderBy: { scheduledAt: 'desc' },
-    take: 100,
-  });
+  const emails = await prisma.email.findMany({ where: { userId: req.user!.id, ...(status ? { status: status as never } : {}) }, orderBy: { scheduledAt: 'desc' }, take: 100 });
   res.json(emails);
 });
 
 app.delete('/api/emails/:id', requireAuth, async (req, res) => {
   const result = await prisma.email.updateMany({ where: { id: req.params.id, userId: req.user!.id, status: 'SCHEDULED' }, data: { status: 'CANCELLED' } });
   if (result.count !== 1) return res.status(409).json({ error: 'email not found or cannot be cancelled' });
+  const job = await queue.getJob(getEmailJobId(req.params.id));
+  if (job) await job.remove();
   res.status(204).send();
 });
 
