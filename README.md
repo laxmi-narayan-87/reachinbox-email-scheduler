@@ -2,21 +2,21 @@
 
 A production-oriented email scheduling platform built from scratch with TypeScript, Express, PostgreSQL, Prisma, Redis, BullMQ, and Next.js.
 
-This implementation combines the useful ideas from multiple reference projects while fixing common scheduler problems such as non-staggered bulk jobs, worker-side `setTimeout`, weak idempotency, and incorrect rate-limit retries.
+This implementation combines useful ideas from multiple reference projects while fixing common scheduler problems such as non-staggered bulk jobs, worker-side `setTimeout`, weak idempotency, and incorrect rate-limit retries.
 
 ## Current architecture
 
 ```text
                     +----------------------+
-                    |    Next.js Dashboard  |
-                    | Compose / Batch / KPI |
+                    |    Next.js Dashboard |
+                    | Compose / Batch / KPI|
                     +-----------+----------+
                                 |
                               HTTP
                                 |
                     +-----------v----------+
                     |     Express API      |
-                    | REST / validation    |
+                    | Auth / REST / Upload |
                     +----+------------+----+
                          |            |
                          v            v
@@ -32,17 +32,17 @@ This implementation combines the useful ideas from multiple reference projects w
                                 | claim/retry |
                                 +------+------+ 
                                        |
-                                       v
-                                +--------------+
-                                | SMTP/Provider|
-                                +--------------+
+                         +-------------+-------------+
+                         |             |             |
+                         v             v             v
+                       SMTP          Gmail       Outlook/Graph
 ```
 
 ## Reliability model
 
-PostgreSQL stores business state. Redis is used for queue coordination and distributed rate limiting. BullMQ owns delivery timing; the worker never sleeps with `setTimeout` to enforce schedule spacing.
+PostgreSQL stores business state. Redis is used for queue coordination and distributed rate limiting. BullMQ owns delivery timing; the worker does not use `setTimeout` for schedule spacing.
 
-Email processing uses this state machine:
+Email processing uses:
 
 ```text
 SCHEDULED -> PROCESSING -> SENT
@@ -58,9 +58,32 @@ SET status = 'PROCESSING', processingAt = NOW()
 WHERE id = ? AND status = 'SCHEDULED';
 ```
 
-Only one worker should observe an affected-row count of `1`, which prevents concurrent workers from independently claiming the same email.
+Only one worker should observe an affected-row count of `1`, preventing concurrent workers from independently claiming the same email.
 
-The system uses at-least-once job processing. External email providers can accept a message immediately before a worker crashes, so the database cannot honestly guarantee exactly-once external delivery. Provider message IDs and deterministic job IDs provide best-effort deduplication.
+The system uses at-least-once job processing. External providers can accept a message immediately before a worker crashes, so exactly-once external delivery cannot be guaranteed by the application alone.
+
+## Outbox pattern
+
+Scheduling writes the email and its `EMAIL_SCHEDULED` outbox event in the same PostgreSQL transaction:
+
+```text
+API request
+   |
+   +--> Email = SCHEDULED
+   |
+   +--> OutboxEvent = PENDING
+          |
+          v
+      publisher
+          |
+          v
+       BullMQ
+          |
+          v
+        worker
+```
+
+This avoids a silent DB-success/queue-failure gap.
 
 ## Rate limiting
 
@@ -70,32 +93,89 @@ Every sender has an hourly quota. The worker uses an atomic Redis counter with a
 email-rate:{senderId}:{YYYYMMDDHH}
 ```
 
-When the quota is exhausted, the current slot is released and the email is scheduled for the next hour instead of using generic exponential retry. This keeps rate limiting separate from ordinary transient-failure retries.
+When the quota is exhausted, the current slot is released and the email is scheduled for the next UTC hour instead of using ordinary exponential retry. Ordinary transient failures use BullMQ retry/backoff separately.
 
-## Bulk scheduling
+## Bulk scheduling and CSV upload
 
-Bulk requests calculate the schedule for every email explicitly:
+Bulk scheduling calculates every delivery time explicitly:
 
 ```text
 baseTime + (index * delayBetweenEmailsMs)
 ```
 
-Example with a five-second delay:
+The API also accepts multipart CSV uploads at:
 
 ```text
-10:00:00 -> recipient 1
-10:00:05 -> recipient 2
-10:00:10 -> recipient 3
-10:00:15 -> recipient 4
+POST /api/batches/upload
 ```
 
-Each email receives a deterministic BullMQ job ID:
+The CSV parser validates the `email` column, counts invalid rows and duplicates, and schedules only unique valid recipients.
+
+Example response summary:
 
 ```text
-email:{emailId}
+Total rows: 10,000
+Valid:       9,721
+Invalid:       181
+Duplicates:     98
 ```
 
-The queue payload contains only the email ID and attempt metadata. The worker loads the full email from PostgreSQL instead of copying large email bodies into Redis.
+## Authentication
+
+Development can use `/api/bootstrap`, but that endpoint is disabled when `NODE_ENV=production`.
+
+Production authentication is Google OAuth:
+
+```text
+GET /auth/google
+    |
+    v
+Google consent
+    |
+    v
+GET /auth/google/callback
+    |
+    +--> verify state
+    +--> exchange code
+    +--> fetch identity
+    +--> create/update User
+    +--> store Gmail token material encrypted
+    +--> create HttpOnly session cookie
+```
+
+You must create the Google OAuth application yourself in Google Cloud Console and provide:
+
+```text
+GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_SECRET
+GOOGLE_CALLBACK_URL
+```
+
+For local development the callback is:
+
+```text
+http://localhost:5000/auth/google/callback
+```
+
+The application requests Gmail send scope so the connected Gmail sender can use the Gmail API.
+
+## Provider credentials
+
+Provider secrets are not returned by sender API responses. SMTP passwords should be sent through `providerConfig.password` and are encrypted before storage when configured through the API.
+
+The repository also supports Gmail and Outlook provider adapters. Their OAuth applications/credentials must be created outside the repository and supplied through environment variables or encrypted sender configuration.
+
+Required encryption key:
+
+```text
+CREDENTIAL_ENCRYPTION_KEY=<base64-encoded 32-byte AES key>
+```
+
+Generate one locally with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
 
 ## Repository structure
 
@@ -103,19 +183,26 @@ The queue payload contains only the email ID and attempt metadata. The worker lo
 reachinbox-email-scheduler/
 ├── apps/
 │   ├── api/
-│   │   └── src/index.ts
+│   │   └── src/
+│   │       ├── auth.ts
+│   │       ├── oauth.ts
+│   │       ├── csv.ts
+│   │       ├── google-routes.ts
+│   │       └── index.ts
 │   ├── worker/
-│   │   └── src/index.ts
+│   │   └── src/
+│   │       ├── provider.ts
+│   │       └── index.ts
 │   └── web/
 │       └── src/app/
 ├── packages/
 │   ├── database/
-│   │   ├── prisma/schema.prisma
-│   │   └── src/client.ts
+│   │   └── prisma/schema.prisma
 │   ├── queue/
 │   │   └── src/index.ts
 │   └── shared/
 │       └── src/index.ts
+├── .github/workflows/ci.yml
 ├── docker-compose.yml
 ├── .env.example
 ├── package.json
@@ -134,7 +221,7 @@ reachinbox-email-scheduler/
 | Queue | BullMQ |
 | Distributed coordination | Redis |
 | Validation | Zod |
-| Mail transport | Nodemailer / SMTP |
+| Mail transport | Nodemailer / SMTP / Gmail API / Microsoft Graph |
 | Local infra | Docker Compose |
 
 ## Local setup
@@ -144,7 +231,7 @@ reachinbox-email-scheduler/
 - Node.js 20+
 - pnpm 10+
 - Docker Desktop or Docker Engine
-- An SMTP account for real delivery, or an Ethereal account for safe development testing
+- SMTP account for real delivery, or Ethereal for safe development testing
 
 ### 2. Install dependencies
 
@@ -158,15 +245,22 @@ pnpm install
 docker compose up -d
 ```
 
-This starts PostgreSQL on `localhost:5432` and Redis on `localhost:6379`.
-
 ### 4. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Update `SMTP_USER` and `SMTP_PASSWORD` when using authenticated SMTP.
+Set at minimum:
+
+```text
+DATABASE_URL
+REDIS_URL
+WEB_ORIGIN
+CREDENTIAL_ENCRYPTION_KEY
+```
+
+Add Google credentials before testing Google login/Gmail sending.
 
 ### 5. Generate Prisma client and run migrations
 
@@ -175,7 +269,7 @@ pnpm db:generate
 pnpm db:migrate
 ```
 
-### 6. Start the services
+### 6. Run services
 
 ```bash
 pnpm dev
@@ -183,124 +277,31 @@ pnpm dev
 
 API: `http://localhost:5000`
 
-Dashboard: `http://localhost:3000`
+Web: `http://localhost:3000`
 
-## API
-
-### Health
-
-```http
-GET /health/live
-GET /health/ready
-```
-
-### Schedule one email
-
-```http
-POST /api/emails
-Content-Type: application/json
-```
-
-```json
-{
-  "senderId": "sender_id",
-  "recipientEmail": "alice@example.com",
-  "subject": "Hello",
-  "body": "Message body",
-  "scheduledAt": "2030-01-01T10:00:00.000Z"
-}
-```
-
-### Schedule a batch
-
-```http
-POST /api/batches
-Content-Type: application/json
-```
-
-```json
-{
-  "senderId": "sender_id",
-  "recipients": [
-    "alice@example.com",
-    "bob@example.com",
-    "carol@example.com"
-  ],
-  "subject": "Campaign",
-  "body": "Campaign body",
-  "scheduledAt": "2030-01-01T10:00:00.000Z",
-  "delayBetweenEmailsMs": 5000
-}
-```
-
-### Dashboard metrics
-
-```http
-GET /api/dashboard/stats
-```
-
-### List emails
-
-```http
-GET /api/emails
-GET /api/emails?status=SENT
-```
-
-### Cancel a scheduled email
-
-```http
-DELETE /api/emails/:id
-```
-
-## Database model
-
-The Prisma schema currently contains:
-
-- `User`
-- `Sender`
-- `Batch`
-- `Email`
-- `OutboxEvent`
-
-The outbox table is included as the foundation for evolving DB-to-queue publication into a transactional outbox publisher rather than relying on an unsafe dual-write assumption.
-
-## Security and production hardening roadmap
-
-The current core scheduler is implemented. The next production hardening phase should add:
-
-- Google OAuth with secure server-side sessions
-- Sender credential encryption / secret management
-- Streaming CSV ingestion with validation and duplicate reporting
-- Transactional outbox publisher
-- Gmail API and Microsoft Graph provider adapters
-- Per-user and per-endpoint authentication/authorization
-- CSRF protection where cookie-based auth requires it
-- Structured audit events
-- Metrics/tracing
-- Dockerfiles for API, worker, and web
-- GitHub Actions for lint, typecheck, tests, Prisma validation, and builds
-- Integration tests using PostgreSQL and Redis
-- Provider-specific idempotency support where available
-
-## Development commands
+### 7. Run quality checks
 
 ```bash
-pnpm dev
-pnpm build
 pnpm typecheck
-pnpm lint
+pnpm build
 pnpm test
-pnpm db:generate
-pnpm db:migrate
-pnpm db:studio
 ```
 
-## Important implementation notes
+## User-only setup still required
 
-The worker intentionally does not use `setTimeout` for email spacing. Delays belong to BullMQ jobs.
+The repository cannot create third-party credentials on your behalf. Before real OAuth/provider testing, you need to:
 
-Rate-limit exhaustion is explicitly delayed until the next UTC hour.
+1. Create a Google Cloud OAuth client and add `http://localhost:5000/auth/google/callback` as an authorized redirect URI.
+2. Put the Google client ID/secret in your local `.env` or deployment secret store.
+3. Generate `CREDENTIAL_ENCRYPTION_KEY` and keep it secret.
+4. Create Microsoft Entra credentials if you want to activate Outlook/Graph OAuth.
+5. Configure your actual SMTP credentials if you want SMTP delivery instead of Ethereal.
 
-Transient provider errors are retried. Permanent failures are recorded as `FAILED` rather than being silently swallowed.
+Never commit `.env` or provider secrets to GitHub.
 
-The API currently assumes a trusted internal `senderId` for the first vertical slice. User authentication and authorization are part of the next hardening phase and should be added before exposing the API publicly.
+## Tests included
+
+- CSV validation and duplicate handling
+- Provider factory selection
+
+The next testing layer should run end-to-end with disposable PostgreSQL/Redis services in CI and a mocked mail provider.
