@@ -1,3 +1,38 @@
+## Engineering summary
+
+ReachInbox is a **reliability-focused email scheduling system**, not simply an email-sending demo.
+
+### Core engineering problems addressed
+
+- Persistent scheduling across process restarts
+- Database-backed delivery state
+- Atomic worker claiming to reduce concurrent duplicate processing
+- Transactional outbox to avoid database/queue gaps
+- Per-sender rate limiting
+- Bulk CSV validation and explicit delivery-time calculation
+- Provider abstraction for SMTP, Gmail, and Outlook
+- At-least-once processing with explicit acknowledgement that exactly-once external delivery cannot be guaranteed
+
+### System boundary
+
+```text
+Dashboard → API → PostgreSQL
+                  ↓
+             Outbox event
+                  ↓
+               Queue
+                  ↓
+                Worker
+                  ↓
+          SMTP / Gmail / Outlook
+```
+
+### What this project demonstrates
+
+The main engineering signal is the handling of **state, timing, concurrency, retries, external dependencies, and failure modes** around an asynchronous workflow.
+
+---
+
 # ReachInbox Email Scheduler
 
 A production-oriented email scheduling platform built from scratch with TypeScript, Express, PostgreSQL, Prisma, Redis, BullMQ, and Next.js.
